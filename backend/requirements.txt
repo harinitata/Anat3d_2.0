@@ -1,0 +1,6 @@
+# Runtime dependencies. After confirming everything works, replace with exact versions
+# from `pip freeze` in your working venv (mediapipe in particular changes between releases).
+fastapi
+uvicorn[standard]
+opencv-python
+mediapipe

@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANAT3D - backend demo page</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0f1218; color: #e6e9ef;
+               font: 14px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hud { position: fixed; top: 12px; left: 12px; display: flex; flex-direction: column; gap: 8px;
+         background: rgba(20,24,32,.85); padding: 12px; border-radius: 10px; max-width: 280px; }
+  #status { display: flex; align-items: center; gap: 8px; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: #d9534f; }
+  #dot.on { background: #3ecf8e; }
+  #last { color: #9aa4b5; font-size: 13px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  button, .file { background: #263042; color: inherit; border: 0; border-radius: 6px;
+                  padding: 6px 10px; cursor: pointer; font: inherit; }
+  button:hover, .file:hover { background: #33415a; }
+  .hint, #hint { color: #7b8599; font-size: 12px; }
+  #parts { position: fixed; top: 12px; right: 12px; bottom: 12px; width: 220px; overflow: auto;
+           background: rgba(20,24,32,.85); padding: 12px; border-radius: 10px; }
+  #parts h3 { margin: 0 0 8px; font-size: 13px; color: #9aa4b5; font-weight: 600; }
+  #parts ul { list-style: none; margin: 0; padding: 0; }
+  #parts li { padding: 4px 6px; border-radius: 4px; cursor: pointer; font-size: 13px; word-break: break-all; }
+  #parts li:hover { background: #263042; }
+  #parts li.active { background: #ffaa00; color: #111; }
+  #drop { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+          font-size: 22px; pointer-events: none; }
+  #drop.show { display: flex; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="hud">
+  <div id="status"><span id="dot"></span><span id="statusText">connecting...</span></div>
+  <div id="last">last event: -</div>
+  <div class="buttons">
+    <button data-act="rotate-left">Rotate L</button>
+    <button data-act="rotate-right">Rotate R</button>
+    <button data-act="zoom-in">Zoom +</button>
+    <button data-act="zoom-out">Zoom -</button>
+    <button data-act="reset">Reset</button>
+    <label class="file">Load .glb<input type="file" id="file" accept=".glb" hidden></label>
+  </div>
+  <div class="buttons">
+    <button id="startBtn">Start gestures</button>
+    <button id="stopBtn">Stop gestures</button>
+  </div>
+  <div id="runState" class="hint">gestures: unknown</div>
+  <div id="hint">Keys: arrows rotate, +/- zoom, R reset. Click a part to highlight it.</div>
+  <div id="modelMsg"></div>
+</div>
+
+<aside id="parts"><h3>Parts (<span id="count">0</span>)</h3><ul id="partList"></ul></aside>
+<div id="drop">Drop a .glb file here</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---- tuning knobs -------------------------------------------------
+const ROTATE_STEP = 0.12;          // radians per rotate event. Flip the sign if direction feels backwards
+const ZOOM_IN_FACTOR = 0.94, ZOOM_OUT_FACTOR = 1.06;
+const MIN_DIST = 1.2, MAX_DIST = 10, HOME_DIST = 3.5;
+const HIGHLIGHT_COLOR = 0xffaa00;
+const MODEL_URL = 'models/model.glb';    // demo/models/model.glb, or use the Load button
+
+// ---- Viewer: the only thing that touches Three.js ----------------
+class Viewer {
+  constructor(canvas) {
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+    this.scene = new THREE.Scene();
+    this.scene.background = new THREE.Color(0x0f1218);
+    this.camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.1));
+    const key = new THREE.DirectionalLight(0xffffff, 2.0);
+    key.position.set(3, 4, 5);
+    this.scene.add(key);
+
+    this.pivot = new THREE.Group();          // rotation happens here
+    this.scene.add(this.pivot);
+    this.meshes = new Map();                 // part name -> mesh
+    this.current = null;                     // highlighted part name
+    this._orig = null;
+    this.onHighlight = null;                 // callback(name|null)
+    this.targetRot = 0; this.targetDist = HOME_DIST; this.dist = HOME_DIST;
+
+    this.loader = new GLTFLoader();
+    this.raycaster = new THREE.Raycaster();
+    addEventListener('resize', () => this._resize());
+    this._resize();
+    this._tick();
+  }
+
+  // ---- public API: gestures / buttons / keyboard / websocket all call these ----
+  rotate(direction) { this.targetRot += (direction === 'right' ? 1 : -1) * ROTATE_STEP; }
+  zoom(direction) {
+    const f = direction === 'in' ? ZOOM_IN_FACTOR : ZOOM_OUT_FACTOR;
+    this.targetDist = Math.min(MAX_DIST, Math.max(MIN_DIST, this.targetDist * f));
+  }
+  resetView() { this.targetRot = 0; this.targetDist = HOME_DIST; }
+
+  highlight(name) {
+    this.clearHighlight();
+    const mesh = this.meshes.get(name);
+    if (!mesh) { console.warn('no such part:', name); return false; }
+    const tint = (m) => {
+      const c = m.clone();                    // clone: shared materials would light up other parts too
+      if (c.emissive) { c.emissive.set(HIGHLIGHT_COLOR); c.emissiveIntensity = 0.9; }
+      else if (c.color) c.color.set(HIGHLIGHT_COLOR);
+      return c;
+    };
+    this._orig = { mesh, material: mesh.material };
+    mesh.material = Array.isArray(mesh.material) ? mesh.material.map(tint) : tint(mesh.material);
+    this.current = name;
+    this.onHighlight?.(name);
+    return true;
+  }
+  clearHighlight() {
+    if (!this._orig) return;
+    const { mesh, material } = this._orig;
+    [].concat(mesh.material).forEach((m) => m.dispose());
+    mesh.material = material;
+    this._orig = null; this.current = null;
+    this.onHighlight?.(null);
+  }
+  toggleHighlight(name) { this.current === name ? this.clearHighlight() : this.highlight(name); }
+
+  pick(clientX, clientY) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const hit = this.raycaster.intersectObjects(this.pivot.children, true).find((h) => h.object.userData.partName);
+    return hit ? hit.object.userData.partName : null;
+  }
+
+  // ---- model loading ----
+  async load(url) {
+    const gltf = await this.loader.loadAsync(url);
+    this.clearHighlight();
+    this.pivot.clear();
+    this.meshes.clear();
+
+    const model = gltf.scene;
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    model.position.sub(center);                                   // centre on origin
+    const wrapper = new THREE.Group();
+    wrapper.scale.setScalar(2 / Math.max(size.x, size.y, size.z)); // normalise to ~2 units
+    wrapper.add(model);
+    this.pivot.add(wrapper);
+
+    let i = 0;
+    model.traverse((o) => {
+      if (!o.isMesh) return;
+      let name = o.name || `mesh_${i}`;
+      if (this.meshes.has(name)) name = `${name}_${i}`;           // keep names unique
+      o.userData.partName = name;
+      this.meshes.set(name, o);
+      i++;
+    });
+    this.resetView();
+    return [...this.meshes.keys()];
+  }
+
+  _resize() {
+    const w = innerWidth, h = innerHeight;
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+  }
+  _tick() {
+    this.pivot.rotation.y += (this.targetRot - this.pivot.rotation.y) * 0.15;   // smooth ~10Hz events
+    this.dist += (this.targetDist - this.dist) * 0.15;
+    this.camera.position.set(0, 0, this.dist);
+    this.camera.lookAt(0, 0, 0);
+    this.renderer.render(this.scene, this.camera);
+    requestAnimationFrame(() => this._tick());
+  }
+}
+
+// ---- wiring ----------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const viewer = new Viewer($('view'));
+
+function renderParts(names) {
+  $('count').textContent = names.length;
+  $('partList').replaceChildren(...names.map((n) => {
+    const li = document.createElement('li');
+    li.textContent = n; li.dataset.name = n;
+    li.onclick = () => viewer.toggleHighlight(n);
+    return li;
+  }));
+}
+viewer.onHighlight = (name) =>
+  document.querySelectorAll('#partList li').forEach((li) => li.classList.toggle('active', li.dataset.name === name));
+
+async function loadModel(url, label) {
+  $('modelMsg').textContent = `loading ${label}...`;
+  try {
+    renderParts(await viewer.load(url));
+    $('modelMsg').textContent = `loaded ${label}`;
+  } catch (e) {
+    console.error(e);
+    $('modelMsg').textContent = `could not load ${label}`;
+  }
+}
+
+// default model: /models/model.glb if present, otherwise ask the user to load one
+fetch(MODEL_URL, { method: 'HEAD' }).then((r) => {
+  if (r.ok) loadModel(MODEL_URL, 'model.glb');
+  else $('modelMsg').textContent = 'No model yet: click "Load .glb" or drop a file here.';
+}).catch(() => {});
+
+function loadFile(file) {
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+  loadModel(url, file.name).finally(() => URL.revokeObjectURL(url));
+}
+$('file').onchange = (e) => loadFile(e.target.files[0]);
+addEventListener('dragover', (e) => { e.preventDefault(); $('drop').classList.add('show'); });
+addEventListener('dragleave', () => $('drop').classList.remove('show'));
+addEventListener('drop', (e) => { e.preventDefault(); $('drop').classList.remove('show'); loadFile(e.dataTransfer.files[0]); });
+
+// one dispatcher for everything: WebSocket messages, buttons and keys all use it
+function dispatch(msg) {
+  switch (msg.action) {
+    case 'rotate': viewer.rotate(msg.direction); break;
+    case 'zoom': viewer.zoom(msg.direction); break;
+    case 'highlight': viewer.highlight(msg.id); break;
+    case 'reset': viewer.resetView(); break;
+    default: return;
+  }
+  $('last').textContent = `last event: ${msg.action}${msg.direction ? ' ' + msg.direction : ''}${msg.id ? ' ' + msg.id : ''}`;
+}
+
+document.querySelectorAll('[data-act]').forEach((b) => b.onclick = () => {
+  const [action, direction] = b.dataset.act.split('-');
+  dispatch({ action, direction });
+});
+addEventListener('keydown', (e) => {
+  const k = e.key;
+  if (k === 'ArrowLeft') dispatch({ action: 'rotate', direction: 'left' });
+  else if (k === 'ArrowRight') dispatch({ action: 'rotate', direction: 'right' });
+  else if (k === '+' || k === '=') dispatch({ action: 'zoom', direction: 'in' });
+  else if (k === '-') dispatch({ action: 'zoom', direction: 'out' });
+  else if (k === 'r' || k === 'R') dispatch({ action: 'reset' });
+});
+$('view').addEventListener('click', (e) => {
+  const name = viewer.pick(e.clientX, e.clientY);
+  name ? viewer.toggleHighlight(name) : viewer.clearHighlight();
+});
+
+// WebSocket client with auto-reconnect
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  const setStatus = (on, text) => { $('dot').classList.toggle('on', on); $('statusText').textContent = text; };
+  ws.onopen = () => setStatus(true, 'backend connected');
+  ws.onclose = () => { setStatus(false, 'backend offline, retrying...'); setTimeout(connect, 2000); };
+  ws.onmessage = (e) => { try { dispatch(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+}
+connect();
+
+// start / stop gesture tracking through the REST API
+async function api(path, method = 'GET') {
+  const r = await fetch(path, { method });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+const showRun = (s) => {
+  $('runState').textContent = s.running ? `gestures running (${s.mode})`
+    : s.error ? `gestures stopped: ${s.error}` : 'gestures stopped';
+};
+const refreshRun = () => api('/api/gestures/status').then(showRun).catch(() => {});
+$('startBtn').onclick = () => api('/api/gestures/start', 'POST').then(showRun).catch((e) => { $('runState').textContent = e.message; });
+$('stopBtn').onclick = () => api('/api/gestures/stop', 'POST').then(showRun).catch(() => {});
+refreshRun();
+setInterval(refreshRun, 3000);
+</script>
+</body>
+</html>
